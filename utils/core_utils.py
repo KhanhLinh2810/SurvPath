@@ -479,7 +479,7 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
 
     # one epoch
     for batch_idx, data in enumerate(loader):
-        
+        print('___________start batch_______________')
         optimizer.zero_grad()
 
         h, y_disc, event_time, censor, clinical_data_list = _process_data_and_forward(model, modality, device, data)
@@ -532,16 +532,17 @@ def _calculate_metrics(loader, dataset_factory, survival_train, all_risk_scores,
         - iauc : Float
     
     """
-    
+    print(all_risk_scores, all_censorships, all_event_times)
     data = loader.dataset.metadata["survival_months_dss"]
     bins_original = dataset_factory.bins
     which_times_to_eval_at = np.array([data.min() + 0.0001, bins_original[1], bins_original[2], data.max() - 0.0001])
 
     #---> delete the nans and corresponding elements from other arrays 
     original_risk_scores = all_risk_scores
-    all_risk_scores = np.delete(all_risk_scores, np.argwhere(np.isnan(original_risk_scores)))
-    all_censorships = np.delete(all_censorships, np.argwhere(np.isnan(original_risk_scores)))
-    all_event_times = np.delete(all_event_times, np.argwhere(np.isnan(original_risk_scores)))
+    nan_indices = np.argwhere(np.isnan(original_risk_scores)).flatten()
+    all_risk_scores = np.delete(all_risk_scores, nan_indices)
+    all_censorships = np.delete(all_censorships, nan_indices)
+    all_event_times = np.delete(all_event_times, nan_indices)
     #<---
 
     c_index = concordance_index_censored((1-all_censorships).astype(bool), all_event_times, all_risk_scores, tied_tol=1e-08)[0]
