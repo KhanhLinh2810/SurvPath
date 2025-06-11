@@ -466,6 +466,7 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
         - total_loss : Float 
     
     """
+    print('___________start epoch_______________')
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.train()
 
@@ -690,6 +691,7 @@ def _summary(dataset_factory, model, modality, loader, loss_fn, survival_train=N
 
 
 def _get_lr_scheduler(args, optimizer, dataloader):
+    print('____________lr_scheduler_______________')
     scheduler_name = args.lr_scheduler
     warmup_epochs = args.warmup_epochs
     epochs = args.max_epochs if hasattr(args, 'max_epochs') else args.epochs
@@ -715,6 +717,7 @@ def _get_lr_scheduler(args, optimizer, dataloader):
             num_warmup_steps=warmup_steps,
             num_training_steps=len(dataloader) * epochs,
         )
+    print('______________end_____________')
     return lr_scheduler
 
 def _step(cur, args, loss_fn, model, optimizer, scheduler, train_loader, val_loader):
@@ -740,7 +743,7 @@ def _step(cur, args, loss_fn, model, optimizer, scheduler, train_loader, val_loa
         - val_iauc : Float
         - total_loss : Float
     """
-
+    print('________________________start training_____________________')
     all_survival = _extract_survival_metadata(train_loader, val_loader)
     
     for epoch in range(args.max_epochs):
@@ -759,7 +762,7 @@ def _step(cur, args, loss_fn, model, optimizer, scheduler, train_loader, val_loa
     #     val_IBS,
     #     val_iauc
     #     ))
-
+    print('________________________end training_____________________')
     return results_dict, (val_cindex, val_cindex_ipcw, val_BS, val_IBS, val_iauc, total_loss)
 
 def _train_val(datasets, cur, args):
