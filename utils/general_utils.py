@@ -184,7 +184,7 @@ def _create_results_dir(args):
         - None 
     
     """
-    args.results_dir = os.path.join("./results", args.results_dir) # create an experiment specific subdir in the results dir 
+    args.results_dir = os.path.join("/content/drive/MyDrive/results", args.results_dir) # create an experiment specific subdir in the results dir 
     if not os.path.isdir(args.results_dir):
         os.makedirs(args.results_dir, exist_ok=True)
         #---> add gitignore to results dir
