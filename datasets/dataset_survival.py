@@ -18,6 +18,10 @@ from torch.utils.data import Dataset
 
 from utils.general_utils import _series_intersection
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
 
 ALL_MODALITIES = ['rna_clean.csv']  
 

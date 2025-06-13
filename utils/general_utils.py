@@ -1,514 +1,865 @@
-#----> general imports
-import torch
-import numpy as np
-import torch.nn as nn
-import pdb
+from __future__ import print_function, division
+from cProfile import label
 import os
-import pandas as pd 
+import pdb
+from unittest import case
+import pandas as pd
+import dgl 
+import pickle
+import networkx as nx
+import numpy as np
+import pandas as pd
+import copy
+from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 
 import torch
-import numpy as np
-import torch.nn as nn
-from torch.utils.data import DataLoader, Sampler, WeightedRandomSampler, RandomSampler, SequentialSampler, sampler
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 
-device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from utils.general_utils import _series_intersection
+import warnings
 
-def _prepare_for_experiment(args):
-    r"""
-    Creates experiment code which will be used for identifying the experiment later on. Uses the experiment code to make results dir.
-    Prints and logs the important settings of the experiment. Loads the pathway composition dataframe and stores in args for future use.
 
-    Args:
-        - args : argparse.Namespace
-    
-    Returns:
-        - args : argparse.Namespace
+ALL_MODALITIES = ['rna_clean.csv']  
 
-    """
+class SurvivalDatasetFactory:
 
-    args.device = device
-    print(args.device)
-    args.split_dir = os.path.join("/content/SurvPath/splits", args.which_splits, args.study)
-    args.combined_study = args.study
-    args = _get_custom_exp_code(args)
-    _seed_torch(args.seed)
+    def __init__(self,
+        study,
+        label_file, 
+        omics_dir,
+        seed, 
+        print_info, 
+        n_bins, 
+        label_col, 
+        eps=1e-6,
+        num_patches=4096,
+        is_mcat=False,
+        is_survpath=True,
+        type_of_pathway="combine",
+        ):
+        r"""
+        Initialize the factory to store metadata, survival label, and slide_ids for each case id. 
 
-    print('Split dir:', args.split_dir)
-    assert os.path.isdir(args.split_dir)
+        Args:
+            - study : String 
+            - label_file : String 
+            - omics_dir : String
+            - seed : Int
+            - print_info : Boolean
+            - n_bins : Int
+            - label_col: String
+            - eps Float
+            - num_patches : Int 
+            - is_mcat : Boolean
+            - is_survapth : Boolean 
+            - type_of_pathway : String
 
-    #---> where to stroe the experiment related assets
-    _create_results_dir(args)
+        Returns:
+            - None
+        """
 
-    #---> store the settings
-    settings = {'num_splits': args.k, 
-                'k_start': args.k_start,
-                'k_end': args.k_end,
-                'task': args.task,
-                'max_epochs': args.max_epochs, 
-                'results_dir': args.results_dir, 
-                'lr': args.lr,
-                'experiment': args.study,
-                'reg': args.reg,
-                # 'label_frac': args.label_frac,
-                'bag_loss': args.bag_loss,
-                'seed': args.seed,
-                'weighted_sample': args.weighted_sample,
-                'opt': args.opt,
-                "num_patches":args.num_patches,
-                "dropout":args.encoder_dropout,
-                "type_of_path":args.type_of_path,
-                'split_dir': args.split_dir
-                }
-    
-    #---> bookkeping
-    _print_and_log_experiment(args, settings)
+        #---> self
+        self.study = study
+        self.label_file = label_file
+        self.omics_dir = omics_dir
+        self.seed = seed
+        self.print_info = print_info
+        self.train_ids, self.val_ids  = (None, None)
+        self.data_dir = None
+        self.label_col = label_col
+        self.n_bins = n_bins
+        self.num_patches = num_patches
+        self.is_mcat = is_mcat
+        self.is_survpath = is_survpath
+        self.type_of_path = type_of_pathway
 
-    #---> load composition df 
-    composition_df = pd.read_csv("/content/SurvPath/datasets_csv/pathway_compositions/{}_comps.csv".format(args.type_of_path), index_col=0)
-    composition_df.sort_index(inplace=True)
-    args.composition_df = composition_df
+        if self.label_col == "survival_months":
+            self.survival_endpoint = "OS"
+            self.censorship_var = "censorship"
+        elif self.label_col == "survival_months_pfi":
+            self.survival_endpoint = "PFI"
+            self.censorship_var = "censorship_pfi"
+        elif self.label_col == "survival_months_dss":
+            self.survival_endpoint = "DSS"
+            self.censorship_var = "censorship_dss"
 
-    return args
-
-def _print_and_log_experiment(args, settings):
-    r"""
-    Prints the expeirmental settings and stores them in a file 
-    
-    Args:
-        - args : argspace.Namespace
-        - settings : dict 
-    
-    Return:
-        - None
+        #---> process omics data
+        self._setup_omics_data() 
         
-    """
-    with open(args.results_dir + '/experiment_{}.txt'.format(args.param_code), 'w') as f:
-        print(settings, file=f)
-
-    f.close()
-
-    print("")
-    print("################# Settings ###################")
-    for key, val in settings.items():
-        print("{}:  {}".format(key, val))
-    print("")
-
-def _get_custom_exp_code(args):
-    r"""
-    Updates the argparse.NameSpace with a custom experiment code.
-
-    Args:
-        - args (NameSpace)
-
-    Returns:
-        - args (NameSpace)
-
-    """
-    dataset_path = 'datasets_csv/all_survival_endpoints'
-    param_code = ''
-
-    #----> Study 
-    param_code += args.study + "_"
-
-    #----> Loss Function
-    param_code += '_%s' % args.bag_loss
-    param_code += '_a%s' % str(args.alpha_surv)
-    
-    #----> Learning Rate
-    param_code += '_lr%s' % format(args.lr, '.0e')
-
-    #----> Regularization
-    # if args.reg_type == 'L1':
-    #   param_code += '_%sreg%s' % (args.reg_type, format(args.reg, '.0e'))
-
-    # if args.reg and args.reg_type == "L2":
-    param_code += "_l2Weight_{}".format(args.reg)
-
-    param_code += '_%s' % args.which_splits.split("_")[0]
-
-    #----> Batch Size
-    param_code += '_b%s' % str(args.batch_size)
-
-    # label col 
-    param_code += "_" + args.label_col
-
-    param_code += "_dim1_" + str(args.encoding_dim)
-    # param_code += "_dim2_" + str(args.encoding_layer_2_dim)
-    
-    param_code += "_patches_" + str(args.num_patches)
-    # param_code += "_dropout_" + str(args.encoder_dropout)
-
-    param_code += "_wsiDim_" + str(args.wsi_projection_dim)
-    param_code += "_epochs_" + str(args.max_epochs)
-    param_code += "_fusion_" + str(args.fusion)
-    param_code += "_modality_" + str(args.modality)
-    param_code += "_pathT_" + str(args.type_of_path)
-
-    #----> Updating
-    args.param_code = param_code
-    args.dataset_path = dataset_path
-
-    return args
-
-
-def _seed_torch(seed=7):
-    r"""
-    Sets custom seed for torch 
-
-    Args:
-        - seed : Int 
-    
-    Returns:
-        - None
-
-    """
-    import random
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if device.type == 'cuda':
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-def _create_results_dir(args):
-    r"""
-    Creates a dir to store results for this experiment. Adds .gitignore 
-    
-    Args:
-        - args: argspace.Namespace
-    
-    Return:
-        - None 
-    
-    """
-    args.results_dir = os.path.join("/content/drive/MyDrive/results", args.results_dir) # create an experiment specific subdir in the results dir 
-    if not os.path.isdir(args.results_dir):
-        os.makedirs(args.results_dir, exist_ok=True)
-        #---> add gitignore to results dir
-        f = open(os.path.join(args.results_dir, ".gitignore"), "w")
-        f.write("*\n")
-        f.write("*/\n")
-        f.write("!.gitignore")
-        f.close()
-    
-    #---> results for this specific experiment
-    args.results_dir = os.path.join(args.results_dir, args.param_code)
-    if not os.path.isdir(args.results_dir):
-        os.mkdir(args.results_dir)
-
-def _get_start_end(args):
-    r"""
-    Which folds are we training on
-    
-    Args:
-        - args : argspace.Namespace
-    
-    Return:
-       folds : np.array 
-    
-    """
-    if args.k_start == -1:
-        start = 0
-    else:
-        start = args.k_start
-    if args.k_end == -1:
-        end = args.k
-    else:
-        end = args.k_end
-    folds = np.arange(start, end)
-    return folds
-
-def _save_splits(split_datasets, column_keys, filename, boolean_style=False):
-    splits = [split_datasets[i].metadata['slide_id'] for i in range(len(split_datasets))]
-    if not boolean_style:
-        df = pd.concat(splits, ignore_index=True, axis=1)
-        df.columns = column_keys
-    else:
-        df = pd.concat(splits, ignore_index = True, axis=0)
-        index = df.values.tolist()
-        one_hot = np.eye(len(split_datasets)).astype(bool)
-        bool_array = np.repeat(one_hot, [len(dset) for dset in split_datasets], axis=0)
-        df = pd.DataFrame(bool_array, index=index, columns = ['train', 'val'])
-
-    df.to_csv(filename)
-    print()
-
-def _series_intersection(s1, s2):
-    r"""
-    Return insersection of two sets
-    
-    Args:
-        - s1 : set
-        - s2 : set 
-    
-    Returns:
-        - pd.Series
-    
-    """
-    return pd.Series(list(set(s1) & set(s2)))
-
-def _print_network(results_dir, net):
-    r"""
-
-    Print the model in terminal and also to a text file for storage 
-    
-    Args:
-        - results_dir : String 
-        - net : PyTorch model 
-    
-    Returns:
-        - None 
-    
-    """
-    num_params = 0
-    num_params_train = 0
-
-    for param in net.parameters():
-        n = param.numel()
-        num_params += n
-        if param.requires_grad:
-            num_params_train += n
-
-    print('Total number of parameters: %d' % num_params)
-    print('Total number of trainable parameters: %d' % num_params_train)
-
-    # print(net)
-
-    fname = "model_" + results_dir.split("/")[-1] + ".txt"
-    path = os.path.join(results_dir, fname)
-    f = open(path, "w")
-    f.write(str(net))
-    f.write("\n")
-    f.write('Total number of parameters: %d \n' % num_params)
-    f.write('Total number of trainable parameters: %d \n' % num_params_train)
-    f.close()
-
-
-def _collate_omics(batch):
-    r"""
-    Collate function for the unimodal omics models 
-    
-    Args:
-        - batch 
-    
-    Returns:
-        - img : torch.Tensor 
-        - omics : torch.Tensor 
-        - label : torch.LongTensor 
-        - event_time : torch.FloatTensor 
-        - c : torch.FloatTensor 
-        - clinical_data_list : List
-        
-    """
-  
-    img = torch.ones([1,1])
-    omics = torch.stack([item[1] for item in batch], dim = 0)
-    label = torch.LongTensor([item[2].long() for item in batch])
-    event_time = torch.FloatTensor([item[3] for item in batch])
-    c = torch.FloatTensor([item[4] for item in batch])
-
-    clinical_data_list = []
-    for item in batch:
-        clinical_data_list.append(item[5])
-
-    return [img, omics, label, event_time, c, clinical_data_list]
-
-
-def _collate_wsi_omics(batch):
-    r"""
-    Collate function for the unimodal wsi and multimodal wsi + omics  models 
-    
-    Args:
-        - batch 
-    
-    Returns:
-        - img : torch.Tensor 
-        - omics : torch.Tensor 
-        - label : torch.LongTensor 
-        - event_time : torch.FloatTensor 
-        - c : torch.FloatTensor 
-        - clinical_data_list : List
-        - mask : torch.Tensor
-        
-    """
-  
-    img = torch.stack([item[0] for item in batch])
-    omics = torch.stack([item[1] for item in batch], dim = 0)
-    label = torch.LongTensor([item[2].long() for item in batch])
-    event_time = torch.FloatTensor([item[3] for item in batch])
-    c = torch.FloatTensor([item[4] for item in batch])
-
-    clinical_data_list = []
-    for item in batch:
-        clinical_data_list.append(item[5])
-
-    mask = torch.stack([item[6] for item in batch], dim=0)
-
-    return [img, omics, label, event_time, c, clinical_data_list, mask]
-
-def _collate_MCAT(batch):
-    r"""
-    Collate function MCAT (pathways version) model
-    
-    Args:
-        - batch 
-    
-    Returns:
-        - img : torch.Tensor 
-        - omic1 : torch.Tensor 
-        - omic2 : torch.Tensor 
-        - omic3 : torch.Tensor 
-        - omic4 : torch.Tensor 
-        - omic5 : torch.Tensor 
-        - omic6 : torch.Tensor 
-        - label : torch.LongTensor 
-        - event_time : torch.FloatTensor 
-        - c : torch.FloatTensor 
-        - clinical_data_list : List
-        
-    """
-    
-    img = torch.stack([item[0] for item in batch])
-
-    omic1 = torch.cat([item[1] for item in batch], dim = 0).type(torch.FloatTensor)
-    omic2 = torch.cat([item[2] for item in batch], dim = 0).type(torch.FloatTensor)
-    omic3 = torch.cat([item[3] for item in batch], dim = 0).type(torch.FloatTensor)
-    omic4 = torch.cat([item[4] for item in batch], dim = 0).type(torch.FloatTensor)
-    omic5 = torch.cat([item[5] for item in batch], dim = 0).type(torch.FloatTensor)
-    omic6 = torch.cat([item[6] for item in batch], dim = 0).type(torch.FloatTensor)
-
-
-    label = torch.LongTensor([item[7].long() for item in batch])
-    event_time = torch.FloatTensor([item[8] for item in batch])
-    c = torch.FloatTensor([item[9] for item in batch])
-
-    clinical_data_list = []
-    for item in batch:
-        clinical_data_list.append(item[10])
-
-    mask = torch.stack([item[11] for item in batch], dim=0)
-
-    return [img, omic1, omic2, omic3, omic4, omic5, omic6, label, event_time, c, clinical_data_list, mask]
-
-def _collate_survpath(batch):
-    r"""
-    Collate function for survpath
-    
-    Args:
-        - batch 
-    
-    Returns:
-        - img : torch.Tensor 
-        - omic_data_list : List
-        - label : torch.LongTensor 
-        - event_time : torch.FloatTensor 
-        - c : torch.FloatTensor 
-        - clinical_data_list : List
-        - mask : torch.Tensor
-        
-    """
-    
-    img = torch.stack([item[0] for item in batch])
-
-    omic_data_list = []
-    for item in batch:
-        omic_data_list.append(item[1])
-
-    label = torch.LongTensor([item[2].long() for item in batch])
-    event_time = torch.FloatTensor([item[3] for item in batch])
-    c = torch.FloatTensor([item[4] for item in batch])
-
-    clinical_data_list = []
-    for item in batch:
-        clinical_data_list.append(item[5])
-
-    mask = torch.stack([item[6] for item in batch], dim=0)
-
-    return [img, omic_data_list, label, event_time, c, clinical_data_list, mask]
-
-def _make_weights_for_balanced_classes_split(dataset):
-    r"""
-    Returns the weights for each class. The class will be sampled proportionally.
-    
-    Args: 
-        - dataset : SurvivalDataset
-    
-    Returns:
-        - final_weights : torch.DoubleTensor 
-    
-    """
-    N = float(len(dataset))                                           
-    weight_per_class = [N/len(dataset.slide_cls_ids[c]) if len(dataset.slide_cls_ids[c]) != 0 else 0 for c in range(len(dataset.slide_cls_ids))]    
-    weight = [0] * int(N)                                           
-    for idx in range(len(dataset)):   
-        y = dataset.getlabel(idx)                   
-        weight[idx] = weight_per_class[y]   
-
-    final_weights = torch.DoubleTensor(weight)
-
-    return final_weights
-
-class SubsetSequentialSampler(Sampler):
-	"""Samples elements sequentially from a given list of indices, without replacement.
-
-	Arguments:
-		indices (sequence): a sequence of indices
-	"""
-	def __init__(self, indices):
-		self.indices = indices
-
-	def __iter__(self):
-		return iter(self.indices)
-
-	def __len__(self):
-		return len(self.indices)
-
-
-def _get_split_loader(args, split_dataset, training = False, testing = False, weighted = False, batch_size=1):
-    r"""
-    Take a dataset and make a dataloader from it using a custom collate function. 
-
-    Args:
-        - args : argspace.Namespace
-        - split_dataset : SurvivalDataset
-        - training : Boolean
-        - testing : Boolean
-        - weighted : Boolean 
-        - batch_size : Int 
-    
-    Returns:
-        - loader : Pytorch Dataloader 
-    
-    """
-
-    kwargs = {'num_workers': 8} if device.type == "cuda" else {}
-    
-    if args.modality in ["omics", "snn", "mlp_per_path"]:
-        collate_fn = _collate_omics
-    elif args.modality in ["abmil_wsi", "abmil_wsi_pathways", "deepmisl_wsi", "deepmisl_wsi_pathways", "mlp_wsi", "transmil_wsi", "transmil_wsi_pathways"]:
-        collate_fn = _collate_wsi_omics
-    elif args.modality in ["coattn", "coattn_motcat"]:  
-        collate_fn = _collate_MCAT
-    elif args.modality == "survpath":
-         collate_fn = _collate_survpath 
-    else:
-        raise NotImplementedError
-
-    if not testing:
-        if training:
-            if weighted:
-                weights = _make_weights_for_balanced_classes_split(split_dataset)
-                loader = DataLoader(split_dataset, batch_size=batch_size, sampler = WeightedRandomSampler(weights, len(weights)), collate_fn = collate_fn, drop_last=False, **kwargs)	
-            else:
-                loader = DataLoader(split_dataset, batch_size=batch_size, sampler = RandomSampler(split_dataset), collate_fn = collate_fn, drop_last=False, **kwargs)
+        #---> labels, metadata, patient_df
+        self._setup_metadata_and_labels(eps)
+
+        #---> prepare for weighted sampling
+        self._cls_ids_prep()
+
+        #---> load all clinical data 
+        self._load_clinical_data()
+
+        #---> summarize
+        self._summarize()
+
+        #---> read the signature files for the correct model/ experiment
+        if self.is_mcat:
+            self._setup_mcat()
+        elif self.is_survpath:
+            self._setup_survpath()
         else:
-            loader = DataLoader(split_dataset, batch_size=batch_size, sampler = SequentialSampler(split_dataset), collate_fn = collate_fn, drop_last=False, **kwargs)
+            self.omic_names = []
+            self.omic_sizes = []
+       
+    def _setup_mcat(self):
+        r"""
+        Process the signatures for the 6 functional groups required to run MCAT baseline
+        
+        Args:
+            - self 
+        
+        Returns:
+            - None 
+        
+        """
+        self.signatures = pd.read_csv("/content/SurvPath/datasets_csv/metadata/signatures.csv")
+        self.omic_names = []
+        for col in self.signatures.columns:
+            omic = self.signatures[col].dropna().unique()
+            omic = sorted(_series_intersection(omic, self.all_modalities["rna"].columns))
+            self.omic_names.append(omic)
+        self.omic_sizes = [len(omic) for omic in self.omic_names]
 
-    else:
-        ids = np.random.choice(np.arange(len(split_dataset), int(len(split_dataset)*0.1)), replace = False)
-        loader = DataLoader(split_dataset, batch_size=batch_size, sampler = SubsetSequentialSampler(ids), collate_fn = collate_fn, drop_last=False, **kwargs )
+    def _setup_survpath(self):
 
-    return loader
+        r"""
+        Process the signatures for the 331 pathways required to run SurvPath baseline. Also provides functinoality to run SurvPath with 
+        MCAT functional families (use the commented out line of code to load signatures)
+        
+        Args:
+            - self 
+        
+        Returns:
+            - None 
+        
+        """
+
+        # for running survpath with mcat signatures 
+        # self.signatures = pd.read_csv("./datasets_csv/metadata/signatures.csv")
+        
+        # running with hallmarks, reactome, and combined signatures
+        self.signatures = pd.read_csv("/content/SurvPath/datasets_csv/metadata/{}_signatures.csv".format(self.type_of_path))
+        
+        self.omic_names = []
+        for col in self.signatures.columns:
+            omic = self.signatures[col].dropna().unique()
+            omic = sorted(_series_intersection(omic, self.all_modalities["rna"].columns))
+            self.omic_names.append(omic)
+        self.omic_sizes = [len(omic) for omic in self.omic_names]
+            
+
+    def _load_clinical_data(self):
+        r"""
+        Load the clinical data for the patient which has grade, stage, etc.
+        
+        Args:
+            - self 
+        
+        Returns:
+            - None
+            
+        """
+        path_to_data = "/content/SurvPath/datasets_csv/clinical_data/{}_clinical.csv".format(self.study)
+        self.clinical_data = pd.read_csv(path_to_data, index_col=0)
+    
+    def _setup_omics_data(self):
+        r"""
+        read the csv with the omics data
+        
+        Args:
+            - self
+        
+        Returns:
+            - None
+        
+        """
+        self.all_modalities = {}
+        for modality in ALL_MODALITIES:
+            self.all_modalities[modality.split('_')[0]] = pd.read_csv(
+                os.path.join('/content/SurvPath/', self.omics_dir, modality),
+                engine='python',
+                index_col=0
+            )
+
+    def _setup_metadata_and_labels(self, eps):
+        r"""
+        Process the metadata required to run the experiment. Clean the data. Set up patient dicts to store slide ids per patient.
+        Get label dict.
+        
+        Args:
+            - self
+            - eps : Float 
+        
+        Returns:
+            - None 
+        
+        """
+
+        #---> read labels 
+        self.label_data = pd.read_csv(
+            os.path.join('/content/SurvPath', self.label_file),
+            index_col=0,
+            sep=',',
+            usecols=['index', 'case_id', 'slide_id', 'age', 'site', 'survival_months', 
+                    'survival_months_dss', 'survival_months_pfi', 'censorship', 
+                    'censorship_dss', 'censorship_pfi', 'is_female', 'oncotree_code', 'train'],
+            low_memory=False
+        )
+        #---> minor clean-up of the labels 
+        uncensored_df = self._clean_label_data()
+
+        #---> create discrete labels
+        self._discretize_survival_months(eps, uncensored_df)
+  
+        #---> get patient info, labels, and metada
+        self._get_patient_dict()
+        self._get_label_dict()
+        self._get_patient_data()
+
+    def _clean_label_data(self):
+        r"""
+        Clean the metadata. For breast, only consider the IDC subtype.
+        
+        Args:
+            - self 
+        
+        Returns:
+            - None
+            
+        """
+
+        if "IDC" in self.label_data['oncotree_code']: # must be BRCA (and if so, use only IDCs)
+            self.label_data = self.label_data[self.label_data['oncotree_code'] == 'IDC']
+
+        self.patients_df = self.label_data.drop_duplicates(['case_id']).copy()
+        uncensored_df = self.patients_df[self.patients_df[self.censorship_var] < 1]
+        
+        return uncensored_df
+
+    def _discretize_survival_months(self, eps, uncensored_df):
+        r"""
+        This is where we convert the regression survival problem into a classification problem. We bin all survival times into 
+        quartiles and assign labels to patient based on these bins.
+        
+        Args:
+            - self
+            - eps : Float 
+            - uncensored_df : pd.DataFrame
+        
+        Returns:
+            - None 
+        
+        """
+        # cut the data into self.n_bins (4= quantiles)
+        disc_labels, q_bins = pd.qcut(uncensored_df[self.label_col], q=self.n_bins, retbins=True, labels=False)
+        q_bins[-1] = self.label_data[self.label_col].max() + eps
+        q_bins[0] = self.label_data[self.label_col].min() - eps
+        
+        # assign patients to different bins according to their months' quantiles (on all data)
+        # cut will choose bins so that the values of bins are evenly spaced. Each bin may have different frequncies
+        disc_labels, q_bins = pd.cut(self.patients_df[self.label_col], bins=q_bins, retbins=True, labels=False, right=False, include_lowest=True)
+        self.patients_df.insert(2, 'label', disc_labels.values.astype(int))
+        self.bins = q_bins
+        
+    def _get_patient_data(self):
+        r"""
+        Final patient data is just the clinical metadata + label for the patient 
+        
+        Args:
+            - self 
+        
+        Returns: 
+            - None
+        
+        """
+        patients_df = self.label_data[~self.label_data.index.duplicated(keep='first')] 
+        patient_data = {'case_id': patients_df["case_id"].values, 'label': patients_df['label'].values} # only setting the final data to self
+        self.patient_data = patient_data
+
+    def _get_label_dict(self):
+        r"""
+        For the discretized survival times and censorship, we define labels and store their counts.
+        
+        Args:
+            - self 
+        
+        Returns:
+            - self 
+        
+        """
+
+        label_dict = {}
+        key_count = 0
+        for i in range(len(self.bins)-1):
+            for c in [0, 1]:
+                label_dict.update({(i, c):key_count})
+                key_count+=1
+
+        for i in self.label_data.index:
+            key = self.label_data.loc[i, 'label']
+            self.label_data.at[i, 'disc_label'] = key
+            censorship = self.label_data.loc[i, self.censorship_var]
+            key = (key, int(censorship))
+            self.label_data.at[i, 'label'] = label_dict[key]
+
+        self.num_classes=len(label_dict)
+        self.label_dict = label_dict
+
+    def _get_patient_dict(self):
+        r"""
+        For every patient store the respective slide ids
+
+        Args:
+            - self 
+        
+        Returns:
+            - None
+        """
+    
+        patient_dict = {}
+        temp_label_data = self.label_data.set_index('case_id')
+        for patient in self.patients_df['case_id']:
+            slide_ids = temp_label_data.loc[patient, 'slide_id']
+            if isinstance(slide_ids, (pd.Series, np.ndarray, list)):
+                slide_ids = np.array(slide_ids)
+            else:
+                slide_ids = np.array([slide_ids])
+            patient_dict.update({patient:slide_ids})
+        self.patient_dict = patient_dict
+        self.label_data = self.patients_df
+        self.label_data.reset_index(drop=True, inplace=True)
+
+    def _cls_ids_prep(self):
+        r"""
+        Find which patient/slide belongs to which label and store the label-wise indices of patients/ slides
+
+        Args:
+            - self 
+        
+        Returns:
+            - None
+
+        """
+        self.patient_cls_ids = [[] for i in range(self.num_classes)]   
+        # Find the index of patients for different labels
+        for i in range(self.num_classes):
+            self.patient_cls_ids[i] = np.where(self.patient_data['label'] == i)[0] 
+
+        # Find the index of slides for different labels
+        self.slide_cls_ids = [[] for i in range(self.num_classes)]
+        for i in range(self.num_classes):
+            self.slide_cls_ids[i] = np.where(self.label_data['label'] == i)[0]
+
+    def _summarize(self):
+        r"""
+        Summarize which type of survival you are using, number of cases and classes
+        
+        Args:
+            - self 
+        
+        Returns:
+            - None 
+        
+        """
+        if self.print_info:
+            print("label column: {}".format(self.label_col))
+            print("number of cases {}".format(len(self.label_data)))
+            print("number of classes: {}".format(self.num_classes))
+
+    def _patient_data_prep(self):
+        patients = np.unique(np.array(self.label_data['case_id'])) # get unique patients
+        patient_labels = []
+        
+        for p in patients:
+            locations = self.label_data[self.label_data['case_id'] == p].index.tolist()
+            assert len(locations) > 0
+            label = self.label_data['label'][locations[0]] # get patient label
+            patient_labels.append(label)
+        
+        self.patient_data = {'case_id': patients, 'label': np.array(patient_labels)}
+
+    @staticmethod
+    def df_prep(data, n_bins, ignore, label_col):
+        mask = data[label_col].isin(ignore)
+        data = data[~mask]
+        data.reset_index(drop=True, inplace=True)
+        _, bins = pd.cut(data[label_col], bins=n_bins)
+        return data, bins
+
+    def return_splits(self, args, csv_path, fold):
+        r"""
+        Create the train and val splits for the fold
+        
+        Args:
+            - self
+            - args : argspace.Namespace 
+            - csv_path : String 
+            - fold : Int 
+        
+        Return: 
+            - datasets : tuple 
+            
+        """
+
+        assert csv_path 
+        all_splits = pd.read_csv(os.path.join('/content/SurvPath', csv_path))
+        print("Defining datasets...")
+        train_split, scaler = self._get_split_from_df(args, all_splits=all_splits, split_key='train', fold=fold, scaler=None)
+        
+        val_split = self._get_split_from_df(args, all_splits=all_splits, split_key='val', fold=fold, scaler=scaler)
+
+        args.omic_sizes = args.dataset_factory.omic_sizes
+        datasets = (train_split, val_split)
+        
+        return datasets
+
+    def _get_scaler(self, data):
+        r"""
+        Define the scaler for training dataset. Use the same scaler for validation set
+        
+        Args:
+            - self 
+            - data : np.array
+
+        Returns: 
+            - scaler : MinMaxScaler
+        
+        """
+        scaler = MinMaxScaler(feature_range=(-1, 1)).fit(data)
+        return scaler
+    
+    def _apply_scaler(self, data, scaler):
+        r"""
+        Given the datatype and a predefined scaler, apply it to the data 
+        
+        Args:
+            - self
+            - data : np.array 
+            - scaler : MinMaxScaler 
+        
+        Returns:
+            - data : np.array """
+        
+        # find out which values are missing
+        zero_mask = data == 0
+
+        # transform data
+        transformed = scaler.transform(data)
+        data = transformed
+
+        # rna -> put back in the zeros 
+        data[zero_mask] = 0.
+        
+        return data
+
+    def _get_split_from_df(self, args, all_splits, split_key: str='train', fold = None, scaler=None, valid_cols=None):
+        r"""
+        Initialize SurvivalDataset object for the correct split and after normalizing the RNAseq data 
+        
+        Args:
+            - self 
+            - args: argspace.Namespace 
+            - all_splits: pd.DataFrame 
+            - split_key : String 
+            - fold : Int 
+            - scaler : MinMaxScaler
+            - valid_cols : List 
+
+        Returns:
+            - SurvivalDataset 
+            - Optional: scaler (MinMaxScaler)
+        
+        """
+
+        if not scaler:
+            scaler = {}
+        split = all_splits[split_key]
+        split = split.dropna().reset_index(drop=True)
+        mask = self.label_data['case_id'].isin(split.tolist())
+        df_metadata_slide = args.dataset_factory.label_data.loc[mask, :].reset_index(drop=True)
+        # select the rna, meth, mut, cnv data for this split
+        omics_data_for_split = {}
+        for key in args.dataset_factory.all_modalities.keys():
+            
+            raw_data_df = args.dataset_factory.all_modalities[key]
+            mask = raw_data_df.index.isin(split.tolist())
+            
+            filtered_df = raw_data_df[mask]
+            filtered_df = filtered_df[~filtered_df.index.duplicated()] # drop duplicate case_ids
+            filtered_df["temp_index"] = filtered_df.index
+            filtered_df.reset_index(inplace=True, drop=True)
+
+            clinical_data_mask = self.clinical_data.case_id.isin(split.tolist())
+            clinical_data_for_split = self.clinical_data[clinical_data_mask]
+            clinical_data_for_split = clinical_data_for_split.set_index("case_id")
+            clinical_data_for_split = clinical_data_for_split.replace(np.nan, "N/A")
+
+            # from metadata drop any cases that are not in filtered_df
+            mask = [True if item in list(filtered_df["temp_index"]) else False for item in df_metadata_slide.case_id]
+            
+            df_metadata_slide = df_metadata_slide[mask]
+            df_metadata_slide.reset_index(inplace=True, drop=True)
+
+            mask = [True if item in list(filtered_df["temp_index"]) else False for item in clinical_data_for_split.index]
+            clinical_data_for_split = clinical_data_for_split[mask]
+            clinical_data_for_split = clinical_data_for_split[~clinical_data_for_split.index.duplicated(keep='first')]
+            
+
+            # normalize your df 
+            filtered_normed_df = None
+            if split_key in ["val"]:
+                
+                # store the case_ids -> create a new df without case_ids
+                case_ids = filtered_df["temp_index"]
+                df_for_norm = filtered_df.drop(labels="temp_index", axis=1)
+
+                # store original num_patients and num_feats 
+                num_patients = df_for_norm.shape[0]
+                num_feats = df_for_norm.shape[1]
+                columns = {}
+                for i in range(num_feats):
+                    columns[i] = df_for_norm.columns[i]
+                
+                # flatten the df into 1D array (make it a column vector)
+                flat_df = np.expand_dims(df_for_norm.values.flatten(), 1)
+
+                # get scaler
+                scaler_for_data = scaler[key]
+
+                # normalize 
+                normed_flat_df = self._apply_scaler(data = flat_df, scaler = scaler_for_data)
+
+                # change 1D to 2D
+                filtered_normed_df = pd.DataFrame(normed_flat_df.reshape([num_patients, num_feats]))
+
+                # add in case_ids
+                filtered_normed_df["temp_index"] = case_ids
+                filtered_normed_df.rename(columns=columns, inplace=True)
+
+            elif split_key == "train":
+                
+                # store the case_ids -> create a new df without case_ids
+                
+                case_ids = filtered_df["temp_index"]
+                df_for_norm = filtered_df.drop(labels="temp_index", axis=1)
+
+                # store original num_patients and num_feats 
+                num_patients = df_for_norm.shape[0]
+                num_feats = df_for_norm.shape[1]
+                columns = {}
+                for i in range(num_feats):
+                    columns[i] = df_for_norm.columns[i]
+                
+                # flatten the df into 1D array (make it a column vector)
+                flat_df = df_for_norm.values.flatten().reshape(-1, 1)
+                
+                # get scaler
+                scaler_for_data = self._get_scaler(flat_df)
+
+                # normalize 
+                normed_flat_df = self._apply_scaler(data = flat_df, scaler = scaler_for_data)
+
+                # change 1D to 2D
+                filtered_normed_df = pd.DataFrame(normed_flat_df.reshape([num_patients, num_feats]))
+
+                # add in case_ids
+                filtered_normed_df["temp_index"] = case_ids
+                filtered_normed_df.rename(columns=columns, inplace=True)
+
+                # store scaler
+                scaler[key] = scaler_for_data
+                
+            omics_data_for_split[key] = filtered_normed_df
+
+        if split_key == "train":
+            sample=True
+        elif split_key == "val":
+            sample=False
+
+        split_dataset = SurvivalDataset(
+            split_key=split_key,
+            fold=fold,
+            study_name=args.study,
+            modality=args.modality,
+            patient_dict=args.dataset_factory.patient_dict,
+            metadata=df_metadata_slide,
+            omics_data_dict=omics_data_for_split,
+            data_dir=args.data_root_dir,  # os.path.join(args.data_root_dir, "{}_20x_features".format(args.combined_study)),
+            num_classes=self.num_classes,
+            label_col = self.label_col,
+            censorship_var = self.censorship_var,
+            valid_cols = valid_cols,
+            is_training=split_key=='train',
+            clinical_data = clinical_data_for_split,
+            num_patches = self.num_patches,
+            omic_names = self.omic_names,
+            sample=sample
+            )
+
+        if split_key == "train":
+            return split_dataset, scaler
+        else:
+            return split_dataset
+    
+    def __len__(self):
+        return len(self.label_data)
+    
+
+class SurvivalDataset(Dataset):
+
+    def __init__(self,
+        split_key,
+        fold,
+        study_name,
+        modality,
+        patient_dict,
+        metadata, 
+        omics_data_dict,
+        data_dir, 
+        num_classes,
+        label_col="survival_months_DSS",
+        censorship_var = "censorship_DSS",
+        valid_cols=None,
+        is_training=True,
+        clinical_data=-1,
+        num_patches=4000,
+        omic_names=None,
+        sample=True,
+        ): 
+
+        super(SurvivalDataset, self).__init__()
+
+        #---> self
+        self.split_key = split_key
+        self.fold = fold
+        self.study_name = study_name
+        self.modality = modality
+        self.patient_dict = patient_dict
+        self.metadata = metadata 
+        self.omics_data_dict = omics_data_dict
+        self.data_dir = data_dir
+        self.num_classes = num_classes
+        self.label_col = label_col
+        self.censorship_var = censorship_var
+        self.valid_cols = valid_cols
+        self.is_training = is_training
+        self.clinical_data = clinical_data
+        self.num_patches = num_patches
+        self.omic_names = omic_names
+        self.num_pathways = len(omic_names)
+        self.sample = sample
+
+        # for weighted sampling
+        self.slide_cls_id_prep()
+    
+    def _get_valid_cols(self):
+        r"""
+        Getter method for the variable self.valid_cols 
+        """
+        return self.valid_cols
+
+    def slide_cls_id_prep(self):
+        r"""
+        For each class, find out how many slides do you have
+        
+        Args:
+            - self 
+        
+        Returns: 
+            - None
+        
+        """
+        self.slide_cls_ids = [[] for _ in range(self.num_classes)]
+        for i in range(self.num_classes):
+            self.slide_cls_ids[i] = np.where(self.metadata['label'] == i)[0]
+
+            
+    def __getitem__(self, idx):
+        r"""
+        Given the modality, return the correctly transformed version of the data
+        
+        Args:
+            - idx : Int 
+        
+        Returns:
+            - variable, based on the modality 
+        
+        """
+        
+        label, event_time, c, slide_ids, clinical_data, case_id = self.get_data_to_return(idx)
+
+        if self.modality in ['omics', 'snn', 'mlp_per_path']:
+
+            df_small = self.omics_data_dict["rna"][self.omics_data_dict["rna"]["temp_index"] == case_id]
+            df_small = df_small.drop(columns="temp_index")
+            df_small = df_small.reindex(sorted(df_small.columns), axis=1)
+            omics_tensor = torch.squeeze(torch.Tensor(df_small.values))
+            
+            return (torch.zeros((1,1)), omics_tensor, label, event_time, c, clinical_data)
+        
+        #@TODO what is the difference between tmil_abmil and transmil_wsi
+        elif self.modality in ["mlp_per_path_wsi", "abmil_wsi", "abmil_wsi_pathways", "deepmisl_wsi", "deepmisl_wsi_pathways", "mlp_wsi", "transmil_wsi", "transmil_wsi_pathways"]:
+
+            df_small = self.omics_data_dict["rna"][self.omics_data_dict["rna"]["temp_index"] == case_id]
+            df_small = df_small.drop(columns="temp_index")
+            df_small = df_small.reindex(sorted(df_small.columns), axis=1)
+            omics_tensor = torch.squeeze(torch.Tensor(df_small.values))
+            patch_features, mask = self._load_wsi_embs_from_path(self.data_dir, slide_ids)
+            
+            #@HACK: returning case_id, remove later
+            return (patch_features, omics_tensor, label, event_time, c, clinical_data, mask)
+
+        elif self.modality in ["coattn", "coattn_motcat"]:
+            
+            patch_features, mask = self._load_wsi_embs_from_path(self.data_dir, slide_ids)
+
+            omic1 = torch.tensor(self.omics_data_dict["rna"][self.omic_names[0]].iloc[idx])
+            omic2 = torch.tensor(self.omics_data_dict["rna"][self.omic_names[1]].iloc[idx])
+            omic3 = torch.tensor(self.omics_data_dict["rna"][self.omic_names[2]].iloc[idx])
+            omic4 = torch.tensor(self.omics_data_dict["rna"][self.omic_names[3]].iloc[idx])
+            omic5 = torch.tensor(self.omics_data_dict["rna"][self.omic_names[4]].iloc[idx])
+            omic6 = torch.tensor(self.omics_data_dict["rna"][self.omic_names[5]].iloc[idx])
+
+            return (patch_features, omic1, omic2, omic3, omic4, omic5, omic6, label, event_time, c, clinical_data, mask)
+        
+        elif self.modality == "survpath":
+            patch_features, mask = self._load_wsi_embs_from_path(self.data_dir, slide_ids)
+
+            omic_list = []
+            for i in range(self.num_pathways):
+                with warnings.catch_warnings():
+                  warnings.simplefilter("ignore", FutureWarning)
+                  omic_list.append(torch.tensor(self.omics_data_dict["rna"][self.omic_names[i]].iloc[idx]))
+            
+            return (patch_features, omic_list, label, event_time, c, clinical_data, mask)
+        
+        else:
+            raise NotImplementedError('Model Type [%s] not implemented.' % self.modality)
+
+    def get_data_to_return(self, idx):
+        r"""
+        Collect all metadata and slide data to return for this case ID 
+        
+        Args:
+            - idx : Int 
+        
+        Returns: 
+            - label : torch.Tensor
+            - event_time : torch.Tensor
+            - c : torch.Tensor
+            - slide_ids : List
+            - clinical_data : tuple
+            - case_id : String
+        
+        """
+        case_id = self.metadata['case_id'][idx]
+        label = torch.Tensor([self.metadata['disc_label'][idx]]) # disc
+        event_time = torch.Tensor([self.metadata[self.label_col][idx]])
+        c = torch.Tensor([self.metadata[self.censorship_var][idx]])
+        slide_ids = self.patient_dict[case_id]
+        clinical_data = self.get_clinical_data(case_id)
+
+        return label, event_time, c, slide_ids, clinical_data, case_id
+    
+    def _load_wsi_embs_from_path(self, data_dir, slide_ids):
+        """
+        Load all the patch embeddings from a list a slide IDs. 
+
+        Args:
+            - self 
+            - data_dir : String 
+            - slide_ids : List
+        
+        Returns:
+            - patch_features : torch.Tensor 
+            - mask : torch.Tensor
+
+        """
+        patch_features = []
+        # load all slide_ids corresponding for the patient
+        for slide_id in slide_ids:
+            wsi_path = os.path.join(data_dir, '{}.pt'.format(slide_id.rstrip('.svs')))
+            with warnings.catch_warnings():
+                  warnings.simplefilter("ignore", FutureWarning)
+                  wsi_bag = torch.load(wsi_path)
+            patch_features.append(wsi_bag)
+        patch_features = torch.cat(patch_features, dim=0)
+
+        if self.sample:
+            max_patches = self.num_patches
+
+            n_samples = min(patch_features.shape[0], max_patches)
+            idx = np.sort(np.random.choice(patch_features.shape[0], n_samples, replace=False))
+            patch_features = patch_features[idx, :]
+        
+            # make a mask 
+            if n_samples == max_patches:
+                # sampled the max num patches, so keep all of them
+                mask = torch.zeros([max_patches])
+            else:
+                # sampled fewer than max, so zero pad and add mask
+                original = patch_features.shape[0]
+                how_many_to_add = max_patches - original
+                zeros = torch.zeros([how_many_to_add, patch_features.shape[1]])
+                patch_features = torch.concat([patch_features, zeros], dim=0)
+                mask = torch.concat([torch.zeros([original]), torch.ones([how_many_to_add])])
+        
+        else:
+            mask = torch.ones([1])
+
+        return patch_features, mask
+
+    def get_clinical_data(self, case_id):
+        """
+        Load all the patch embeddings from a list a slide IDs. 
+
+        Args:
+            - data_dir : String 
+            - slide_ids : List
+        
+        Returns:
+            - patch_features : torch.Tensor 
+            - mask : torch.Tensor
+
+        """
+        try:
+            stage = self.clinical_data.loc[case_id, "stage"]
+        except:
+            stage = "N/A"
+        
+        try:
+            grade = self.clinical_data.loc[case_id, "grade"]
+        except:
+            grade = "N/A"
+
+        try:
+            subtype = self.clinical_data.loc[case_id, "subtype"]
+        except:
+            subtype = "N/A"
+        
+        clinical_data = (stage, grade, subtype)
+        return clinical_data
+    
+    def getlabel(self, idx):
+        r"""
+        Use the metadata for this dataset to return the survival label for the case 
+        
+        Args:
+            - idx : Int 
+        
+        Returns:
+            - label : Int 
+        
+        """
+        label = self.metadata['label'][idx]
+        return label
+
+    def __len__(self):
+        return len(self.metadata) 
