@@ -7,8 +7,8 @@ MODEL="survpath" # what type of model do you want to train?
 DIM1=8
 DIM2=16
 STUDIES=("blca")
-LRS=(0.00005 0.0001 0.0005 0.001)
-DECAYS=(0.00001 0.0001 0.001 0.01)
+LRS=(0.00005 )
+DECAYS=(0.00001)
 
 for decay in ${DECAYS[@]};
 do
