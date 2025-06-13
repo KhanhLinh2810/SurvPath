@@ -479,7 +479,6 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
 
     # one epoch
     for batch_idx, data in enumerate(loader):
-        print('___________start batch_______________')
         optimizer.zero_grad()
 
         h, y_disc, event_time, censor, clinical_data_list = _process_data_and_forward(model, modality, device, data)
@@ -498,8 +497,7 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
         optimizer.step()
         scheduler.step()
 
-        if (batch_idx % 20) == 0:
-            print("batch: {}, loss: {:.3f}".format(batch_idx, loss.item()))
+        print("batch: {}, loss: {:.3f}".format(batch_idx, loss.item()))
     
     total_loss /= len(loader.dataset)
     all_risk_scores = np.concatenate(all_risk_scores, axis=0)
