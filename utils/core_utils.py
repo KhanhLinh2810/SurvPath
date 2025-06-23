@@ -74,7 +74,7 @@ def _init_loss_function(args):
     """
     print('\nInit loss function...', end=' ')
     if args.bag_loss == 'nll_surv':
-        loss_fn = NLLSurvLoss(alpha=args.alpha_surv)
+        loss_fn = NLLSurvLoss(alpha=args.alpha_surv) #Negative Log-Likelihood 
     else:
         raise NotImplementedError
     print('Done!')
@@ -497,7 +497,8 @@ def _train_loop_survival(epoch, model, modality, loader, optimizer, scheduler, l
         optimizer.step()
         scheduler.step()
 
-        print("batch: {}, loss: {:.3f}".format(batch_idx, loss.item()))
+        if(batch_idx%10 == 0):
+            print("batch: {}, loss: {:.3f}".format(batch_idx, loss.item()))
     
     total_loss /= len(loader.dataset)
     all_risk_scores = np.concatenate(all_risk_scores, axis=0)
